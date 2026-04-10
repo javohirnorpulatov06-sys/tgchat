@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Iterable, Tuple
+from typing import Iterable, List, Tuple
 
 import google.generativeai as genai
 
@@ -18,6 +18,9 @@ class GeminiService:
         genai.configure(api_key=api_key)
         self._requested_model_name = model_name
         self._fallback_models = (
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-1.5-flash-8b",
             "gemini-1.5-flash",
             "gemini-1.5-pro-latest",
             "gemini-1.5-flash-latest",
@@ -25,6 +28,20 @@ class GeminiService:
         )
         self._twin_name = twin_name
         self._user_nickname = user_nickname
+
+    @staticmethod
+    def _normalize_model_name(name: str) -> str:
+        clean = name.strip()
+        return clean if clean.startswith("models/") else f"models/{clean}"
+
+    def _discover_available_models(self) -> List[str]:
+        """Return model names that support generateContent for this API key."""
+        available: List[str] = []
+        for model in genai.list_models():
+            methods = getattr(model, "supported_generation_methods", []) or []
+            if "generateContent" in methods and model.name.startswith("models/gemini"):
+                available.append(model.name)
+        return available
 
     def _build_system_prompt(self) -> str:
         return (
@@ -61,8 +78,15 @@ class GeminiService:
         prompt = self._build_prompt(history, user_message)
 
         def _call_model() -> str:
-            candidates = [self._requested_model_name]
-            candidates.extend(name for name in self._fallback_models if name != self._requested_model_name)
+            requested = self._normalize_model_name(self._requested_model_name)
+            fallbacks = [self._normalize_model_name(name) for name in self._fallback_models]
+            discovered = self._discover_available_models()
+
+            candidates = [requested]
+            candidates.extend(name for name in fallbacks if name != requested)
+            candidates.extend(name for name in discovered if name not in candidates)
+
+            logger.info("Gemini candidate models: %s", ", ".join(candidates))
 
             last_error: Exception | None = None
             for candidate in candidates:
