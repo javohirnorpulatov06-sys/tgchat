@@ -6,6 +6,7 @@ import asyncio
 import logging
 from typing import Iterable, List, Tuple
 
+import edge_tts
 import google.generativeai as genai
 
 logger = logging.getLogger(__name__)
@@ -14,7 +15,14 @@ logger = logging.getLogger(__name__)
 class GeminiService:
     """Service that builds persona prompt and calls Gemini model."""
 
-    def __init__(self, api_key: str, model_name: str, twin_name: str, user_nickname: str) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model_name: str,
+        twin_name: str,
+        user_nickname: str,
+        tts_voice: str,
+    ) -> None:
         genai.configure(api_key=api_key)
         self._requested_model_name = model_name
         self._fallback_models = (
@@ -28,6 +36,12 @@ class GeminiService:
         )
         self._twin_name = twin_name
         self._user_nickname = user_nickname
+        self._tts_voice = tts_voice
+        self._tts_fallback_voices = (
+            "uz-UZ-MadinaNeural",
+            "tr-TR-EmelNeural",
+            "en-US-JennyNeural",
+        )
 
     @staticmethod
     def _normalize_model_name(name: str) -> str:
@@ -42,6 +56,16 @@ class GeminiService:
             if "generateContent" in methods and model.name.startswith("models/gemini"):
                 available.append(model.name)
         return available
+
+    def _candidate_models(self) -> List[str]:
+        requested = self._normalize_model_name(self._requested_model_name)
+        fallbacks = [self._normalize_model_name(name) for name in self._fallback_models]
+        discovered = self._discover_available_models()
+
+        candidates = [requested]
+        candidates.extend(name for name in fallbacks if name != requested)
+        candidates.extend(name for name in discovered if name not in candidates)
+        return candidates
 
     def _build_system_prompt(self) -> str:
         return (
@@ -78,14 +102,7 @@ class GeminiService:
         prompt = self._build_prompt(history, user_message)
 
         def _call_model() -> str:
-            requested = self._normalize_model_name(self._requested_model_name)
-            fallbacks = [self._normalize_model_name(name) for name in self._fallback_models]
-            discovered = self._discover_available_models()
-
-            candidates = [requested]
-            candidates.extend(name for name in fallbacks if name != requested)
-            candidates.extend(name for name in discovered if name not in candidates)
-
+            candidates = self._candidate_models()
             logger.info("Gemini candidate models: %s", ", ".join(candidates))
 
             last_error: Exception | None = None
@@ -114,3 +131,58 @@ class GeminiService:
         if not text:
             return "Bugun jim qolibman, lekin yoningdaman. Gapni davom ettiraylikmi?"
         return text
+
+    async def transcribe_voice(self, voice_bytes: bytes, mime_type: str = "audio/ogg") -> str:
+        """Transcribe Telegram voice message bytes into text with Gemini."""
+
+        prompt = (
+            "Quyidagi audio xabarni aniq matnga ko'chir. "
+            "Faqat transkripsiyani qaytar, izoh yozma."
+        )
+
+        def _call_model() -> str:
+            last_error: Exception | None = None
+            for candidate in self._candidate_models():
+                try:
+                    model = genai.GenerativeModel(candidate)
+                    response = model.generate_content(
+                        [
+                            prompt,
+                            {"mime_type": mime_type, "data": voice_bytes},
+                        ]
+                    )
+                    text = (response.text or "").strip()
+                    if text:
+                        return text
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning("Transcription model '%s' failed: %s", candidate, exc)
+
+            if last_error is not None:
+                raise last_error
+            return ""
+
+        return await asyncio.to_thread(_call_model)
+
+    async def synthesize_speech(self, text: str) -> bytes:
+        """Convert text to speech audio bytes (mp3)."""
+        voices = [self._tts_voice]
+        voices.extend(v for v in self._tts_fallback_voices if v != self._tts_voice)
+
+        last_error: Exception | None = None
+        for voice in voices:
+            try:
+                communicator = edge_tts.Communicate(text=text, voice=voice)
+                chunks = bytearray()
+                async for chunk in communicator.stream():
+                    if chunk.get("type") == "audio":
+                        chunks.extend(chunk.get("data", b""))
+                if chunks:
+                    return bytes(chunks)
+            except Exception as exc:
+                last_error = exc
+                logger.warning("TTS voice '%s' failed: %s", voice, exc)
+
+        if last_error is not None:
+            raise last_error
+        return b""
