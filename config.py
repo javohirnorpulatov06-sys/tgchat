@@ -24,6 +24,7 @@ class Settings:
     twin_name: str
     user_nickname: str
     gemini_model: str
+    tts_voice: str
 
 
 def _require_env(name: str) -> str:
@@ -43,4 +44,6 @@ def load_settings() -> Settings:
         user_nickname=os.getenv("USER_NICKNAME", "aka").strip() or "aka",
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
         or "gemini-1.5-flash",
+        tts_voice=os.getenv("TTS_VOICE", "uz-UZ-MadinaNeural").strip()
+        or "uz-UZ-MadinaNeural",
     )
