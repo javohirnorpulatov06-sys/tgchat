@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Iterable, Tuple
 
 import google.generativeai as genai
+
+logger = logging.getLogger(__name__)
 
 
 class GeminiService:
@@ -13,7 +16,13 @@ class GeminiService:
 
     def __init__(self, api_key: str, model_name: str, twin_name: str, user_nickname: str) -> None:
         genai.configure(api_key=api_key)
-        self._model = genai.GenerativeModel(model_name)
+        self._requested_model_name = model_name
+        self._fallback_models = (
+            "gemini-1.5-flash",
+            "gemini-1.5-pro-latest",
+            "gemini-1.5-flash-latest",
+            "gemini-pro",
+        )
         self._twin_name = twin_name
         self._user_nickname = user_nickname
 
@@ -52,9 +61,30 @@ class GeminiService:
         prompt = self._build_prompt(history, user_message)
 
         def _call_model() -> str:
-            response = self._model.generate_content(prompt)
-            text = (response.text or "").strip()
-            return text
+            candidates = [self._requested_model_name]
+            candidates.extend(name for name in self._fallback_models if name != self._requested_model_name)
+
+            last_error: Exception | None = None
+            for candidate in candidates:
+                try:
+                    model = genai.GenerativeModel(candidate)
+                    response = model.generate_content(prompt)
+                    text = (response.text or "").strip()
+                    if text:
+                        if candidate != self._requested_model_name:
+                            logger.warning(
+                                "Primary Gemini model '%s' failed, fallback '%s' succeeded.",
+                                self._requested_model_name,
+                                candidate,
+                            )
+                        return text
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning("Gemini model '%s' failed: %s", candidate, exc)
+
+            if last_error is not None:
+                raise last_error
+            return ""
 
         text = await asyncio.to_thread(_call_model)
         if not text:
