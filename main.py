@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
+import io
 import logging
 
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from config import Settings, load_settings
@@ -24,7 +25,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     settings: Settings = context.application.bot_data["settings"]
     welcome_text = (
         f"Assalomu alaykum! Men {settings.twin_name}.\n"
-        "Yurakdan gaplashamizmi? Menga oddiy yozing, men doim yoningizdaman."
+        "Yurakdan gaplashamizmi? Menga matn yoki ovoz yuboring, men doim yoningizdaman."
     )
     if update.message:
         await update.message.reply_text(welcome_text)
@@ -42,12 +43,66 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not user_text:
         return
 
+    await _process_and_reply(update=update, context=context, user_id=user_id, user_text=user_text)
+
+
+async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user or not update.message.voice:
+        return
+
+    gemini_service: GeminiService = context.application.bot_data["gemini"]
+    voice = update.message.voice
+    user_id = int(update.effective_user.id)
+
+    try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+        telegram_file = await context.bot.get_file(voice.file_id)
+        voice_bytes = bytes(await telegram_file.download_as_bytearray())
+        transcription = (await gemini_service.transcribe_voice(voice_bytes=voice_bytes, mime_type="audio/ogg")).strip()
+        if not transcription:
+            await update.message.reply_text("Ovozni to'liq tushunolmadim, iltimos qayta yuboring.")
+            return
+
+        await _process_and_reply(
+            update=update,
+            context=context,
+            user_id=user_id,
+            user_text=transcription,
+            include_voice=True,
+        )
+    except Exception:
+        logger.exception("Failed while processing voice message")
+        await update.message.reply_text("Kechirasiz, hozir javob bera olmadim")
+
+
+async def _process_and_reply(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    user_text: str,
+    include_voice: bool = False,
+) -> None:
+    db: Database = context.application.bot_data["db"]
+    gemini_service: GeminiService = context.application.bot_data["gemini"]
+
+    if not update.message:
+        return
+
     try:
         await db.add_message(user_id=user_id, role="user", content=user_text)
         history = await db.get_recent_messages(user_id=user_id, limit=20)
         reply = await gemini_service.generate_reply(history=history, user_message=user_text)
         await db.add_message(user_id=user_id, role="assistant", content=reply)
+
         await update.message.reply_text(reply)
+
+        if include_voice:
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.RECORD_VOICE)
+            audio_bytes = await gemini_service.synthesize_speech(reply)
+            if audio_bytes:
+                audio_file = io.BytesIO(audio_bytes)
+                audio_file.name = "hamroh-voice.mp3"
+                await update.message.reply_audio(audio=audio_file, title="Hamroh ovozi")
     except Exception:
         logger.exception("Failed while processing user message")
         await update.message.reply_text("Kechirasiz, hozir javob bera olmadim")
@@ -73,6 +128,7 @@ async def post_init(application: Application) -> None:
         model_name=settings.gemini_model,
         twin_name=settings.twin_name,
         user_nickname=settings.user_nickname,
+        tts_voice=settings.tts_voice,
     )
     logger.info("Bot resources initialized")
 
@@ -95,6 +151,7 @@ def build_application(settings: Settings) -> Application:
     )
     app.bot_data["settings"] = settings
     app.add_handler(CommandHandler("start", start_handler))
+    app.add_handler(MessageHandler(filters.VOICE, voice_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
     return app
